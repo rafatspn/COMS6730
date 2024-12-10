@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torchvision
@@ -5,6 +6,9 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import torch.optim as optim
 import matplotlib.pyplot as plt
+
+# Directory to save gradients
+os.makedirs("gradients", exist_ok=True)
 
 # ------------------------
 # 1. Define the Network
@@ -52,6 +56,7 @@ val_accuracies = []
 for epoch in range(num_epochs):
     model.train()
     running_loss = 0.0
+    epoch_gradients = {}
 
     for images, labels in trainloader:
         images, labels = images.to(device), labels.to(device)
@@ -63,6 +68,14 @@ for epoch in range(num_epochs):
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
+
+        # Save gradients for this batch
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                if name not in epoch_gradients:
+                    epoch_gradients[name] = []
+                epoch_gradients[name].append(param.grad.clone().detach().cpu())
+
         optimizer.step()
 
         running_loss += loss.item()
@@ -86,6 +99,8 @@ for epoch in range(num_epochs):
 
     accuracy = 100 * correct / total
     val_accuracies.append(accuracy)
+
+    torch.save(epoch_gradients, f"gradients/gradients_epoch_{epoch+1}.pt")
 
     print(f"Epoch [{epoch+1}/{num_epochs}] - Loss: {running_loss / len(trainloader):.4f}, Val Accuracy: {accuracy:.2f}%")
 

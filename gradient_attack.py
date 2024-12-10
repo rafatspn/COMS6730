@@ -26,7 +26,7 @@ class SimpleNet(nn.Module):
 # -------------------------
 transform = transforms.Compose([transforms.ToTensor()])
 trainset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-trainloader = torch.utils.data.DataLoader(trainset, batch_size=1000, shuffle=True)
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=1, shuffle=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -78,58 +78,71 @@ accuracy = correct / labels.size(0) * 100  # Accuracy as a percentage
 print(f"Loss2: {loss.item():.4f}")
 print(f"Accuracy2: {accuracy:.2f}%")
 
-# # Save the real gradients
-# real_gradients = [param.grad.clone() for param in model.parameters()]
+# Save the real gradients
+real_gradients = [param.grad.clone() for param in model.parameters()]
 
-# # -------------------------
-# # 4. Dummy Data Initialization
-# # -------------------------
-# # Initialize dummy data and labels
-# dummy_data = torch.randn_like(images, requires_grad=True, device=device)
-# dummy_label = torch.randint(0, 10, (1,), device=device)
+# -------------------------
+# 4. Dummy Data Initialization
+# -------------------------
+# Initialize dummy data and labels
+dummy_data = torch.randn_like(images, requires_grad=True, device=device)
+dummy_label = labels# torch.randint(0, 10, (1,), device=device)
 
-# # -------------------------
-# # 5. Optimization to Match Gradients
-# # -------------------------
+# -------------------------
+# 5. Optimization to Match Gradients
+# -------------------------
 # optimizer = optim.LBFGS([dummy_data])
-# loss_fn = nn.CrossEntropyLoss()
+optimizer = optim.Adam([dummy_data], lr=0.01)
 
-# def closure():
-#     optimizer.zero_grad()
-#     dummy_output = model(dummy_data)
-#     dummy_loss = loss_fn(dummy_output, dummy_label)
-#     dummy_loss.backward()
+loss_fn = nn.CrossEntropyLoss()
 
-#     # Match gradients
-#     dummy_gradients = [param.grad for param in model.parameters()]
-#     gradient_loss = sum(torch.norm(g1 - g2)**2 for g1, g2 in zip(dummy_gradients, real_gradients))
+def closure():
+    optimizer.zero_grad()
+    dummy_output = model(dummy_data)
+    dummy_loss = loss_fn(dummy_output, dummy_label)
+    dummy_loss.backward()
+
+    # Match gradients
+    dummy_gradients = [param.grad for param in model.parameters()]
+    gradient_loss = sum(torch.norm(g1 - g2)**2 for g1, g2 in zip(dummy_gradients, real_gradients))
     
-#     gradient_loss.requires_grad = True
-#     gradient_loss.backward()
-#     return gradient_loss
+    gradient_loss.requires_grad = True
+    gradient_loss.backward()
+    return gradient_loss
 
-# # -------------------------
-# # 6. Run the Optimization
-# # -------------------------
-# for i in range(300):  # Number of iterations
+# -------------------------
+# 6. Run the Optimization
+# -------------------------
+# for i in range(3000):  # Number of iterations
 #     optimizer.step(closure)
 #     if i % 50 == 0:
 #         print(f"Iteration {i} | Dummy Loss: {closure().item()}")
+
+for i in range(1):
+    # Perform one optimization step
+    gradient_loss = closure()
+    optimizer.step()
+
+    if i % 100 == 0:
+        print(f"Iteration {i} | Gradient Matching Loss: {gradient_loss.item():.4f}")
+
 
 # # -------------------------
 # # 7. Visualize the Results
 # # -------------------------
 
 
-# plt.figure(figsize=(10, 5))
+plt.figure(figsize=(10, 5))
 
-# # Real Image
-# plt.subplot(1, 2, 1)
-# plt.title("Real Image")
-# plt.imshow(images[0].cpu().detach().numpy().squeeze(), cmap='gray')
+# Real Image
+plt.subplot(1, 2, 1)
+plt.title("Real Image")
+plt.imshow(images[0].cpu().detach().numpy().squeeze(), cmap='gray')
+plt.savefig("oim_basic")
 
-# # Reconstructed Image
-# plt.subplot(1, 2, 2)
-# plt.title("Reconstructed Image")
-# plt.imshow(dummy_data[0].cpu().detach().numpy().squeeze(), cmap='gray')
-# plt.show()
+# Reconstructed Image
+plt.subplot(1, 2, 2)
+plt.title("Reconstructed Image")
+plt.imshow(dummy_data[0].cpu().detach().numpy().squeeze(), cmap='gray')
+plt.show()
+plt.savefig("rci_basi")
