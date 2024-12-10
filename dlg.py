@@ -14,7 +14,7 @@ def total_variation_loss(img):
 # Function to match gradients and reconstruct image
 def deep_leakage_reconstruct(real_image, model, real_label, device, steps=2000, lr=0.1):
     # Dummy data initialization
-    dummy_data = torch.randn_like(real_image, requires_grad=True, device=device)
+    dummy_data = torch.rand_like(real_image, requires_grad=True, device=device)
     optimizer = optim.Adam([dummy_data], lr=lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
     loss_fn = nn.CrossEntropyLoss()
