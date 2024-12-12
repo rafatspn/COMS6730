@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,10 +8,10 @@ import torchvision
 from torchvision.utils import save_image
 
 # Configuration
-num_clients = 5
-num_adversaries = 1
-num_data_per_client = 3
+num_clients = 10
+num_data_per_client = 2
 mode = 'test'
+server_model_path = "server_model.pth"
 
 # ----------------------- DLG Model: Generate Reconstructed Images -----------------------
 def deep_leakage_reconstruct(real_image, model, real_label, device, steps=1000, lr=0.1):
@@ -111,7 +112,7 @@ def test_single_images(model, test_images, test_labels, device):
             output = model(image).squeeze()
             prediction = "Real" if output > 0.5 else "Reconstructed"
             confidence = output.item()
-            print(f"Image {idx+1}: Prediction={prediction}, Confidence={confidence:.4f}, Ground Truth={'Real' if label == 1 else 'Reconstructed'}")
+            # print(f"Image {idx+1}: Prediction={prediction}, Confidence={confidence:.4f}, Ground Truth={'Real' if label == 1 else 'Reconstructed'}")
 
 # ----------------------- Client Class -----------------------
 class Client:
@@ -151,17 +152,56 @@ class Client:
 
 # ----------------------- Server Class -----------------------
 class Server:
-    def __init__(self, num_clients, device):
+    def __init__(self, num_clients, device, adversary_ids, server_model_path):
         self.num_clients = num_clients
         self.device = device
         self.clients = [Client(i, device) for i in range(num_clients)]
         self.global_model = RealFakeClassifier().to(device)
+        self.adversary_ids = adversary_ids
+        self.server_model_path = server_model_path
+
+        # Load or pre-train the server model
+        self._initialize_server_model()
+
+    def _initialize_server_model(self):
+        if os.path.exists(self.server_model_path):
+            # Load existing model
+            self.global_model.load_state_dict(torch.load(self.server_model_path))
+            print(f"Loaded existing server model from {self.server_model_path}")
+        else:
+            # Pre-train server model with some synthetic "real and reconstructed" data
+            print("No pre-trained server model found. Pre-training the server model...")
+            # Create a small synthetic dataset
+            # For demonstration, let's just create a small random dataset of 20 samples
+            real_images = torch.randn(10, 3, 32, 32)  # Real images
+            real_labels = torch.ones(10)              # Label 1 for real
+            fake_images = torch.randn(10, 3, 32, 32)  # Fake images
+            fake_labels = torch.zeros(10)             # Label 0 for fake
+
+            images = torch.cat([real_images, fake_images], dim=0)
+            labels = torch.cat([real_labels, fake_labels], dim=0)
+
+            train_dataset = SingleImageDataset(images, labels)
+            train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+            criterion = nn.BCELoss()
+            optimizer = optim.Adam(self.global_model.parameters(), lr=0.001)
+
+            # Pre-train the model
+            train(self.global_model, train_loader, criterion, optimizer, self.device, epochs=5)
+
+            # Save the pre-trained model
+            torch.save(self.global_model.state_dict(), self.server_model_path)
+            print(f"Pre-trained server model saved to {self.server_model_path}")
 
     def aggregate_updates(self, updates):
         global_state_dict = self.global_model.state_dict()
         for key in global_state_dict:
             global_state_dict[key] = torch.stack([update[key] for update in updates]).mean(dim=0)
         self.global_model.load_state_dict(global_state_dict)
+
+        # Save the updated model
+        torch.save(self.global_model.state_dict(), self.server_model_path)
+        print(f"Updated server model saved to {self.server_model_path}")
 
     def receive_updates(self):
         updates = []
@@ -170,17 +210,38 @@ class Server:
         return updates
 
     def detect_adversaries(self):
-        adversarial_clients = []
+        adversarial_clients_detected = []
         for client in self.clients:
             client.test()
             if client.is_adversarial():
-                adversarial_clients.append(client.client_id)
+                adversarial_clients_detected.append(client.client_id)
                 print(f"Client {client.client_id} is detected as adversarial.")
-        print(f"Adversarial clients detected: {adversarial_clients}")
+
+        print(f"Adversarial clients detected: {adversarial_clients_detected}")
+
+        # Calculate detection accuracy
+        tp = sum(1 for cid in adversarial_clients_detected if cid in self.adversary_ids)
+        fp = sum(1 for cid in adversarial_clients_detected if cid not in self.adversary_ids)
+        fn = sum(1 for cid in self.adversary_ids if cid not in adversarial_clients_detected)
+        tn = self.num_clients - (tp + fp + fn)
+
+        accuracy = (tp + tn) / self.num_clients
+        accuracy_str = f"Adversary Detection Accuracy: {accuracy * 100:.2f}%"
+        print(accuracy_str)
+
+        # Save results to a text file
+        with open("results.txt", "w") as f:
+            f.write(f"Ground Truth Adversaries: {self.adversary_ids}\n")
+            f.write(f"Detected Adversaries: {adversarial_clients_detected}\n")
+            f.write(f"TP: {tp}, FP: {fp}, FN: {fn}, TN: {tn}\n")
+            f.write(accuracy_str + "\n")
 
 # ----------------------- Main Function -----------------------
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Define known adversarial clients
+    adversary_ids = [2,3,7,9]  # ground truth list of adversaries
 
     # Load pre-trained ResNet18 for gradient leakage
     model_resnet = torchvision.models.resnet18(pretrained=False)
@@ -192,8 +253,8 @@ def main():
     dataset = torchvision.datasets.MNIST(root="./data", train=True, download=True, transform=transform)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
-    # Initialize server
-    server = Server(num_clients, device)
+    # Initialize server (will load or pre-train and save global model)
+    server = Server(num_clients, device, adversary_ids, server_model_path)
 
     # Distribute data to clients
     client_data = [[] for _ in range(num_clients)]
@@ -204,8 +265,8 @@ def main():
             break
         client_id = i // num_data_per_client
         real_image, label = real_image.to(device), label.to(device)
-        adv_id = 2
-        if client_id == adv_id:
+
+        if client_id in adversary_ids:
             fake_image = deep_leakage_reconstruct(real_image, model_resnet, label, device)
             client_data[client_id].append(fake_image.cpu())
             client_labels[client_id].append(0)  # Fake
@@ -214,8 +275,8 @@ def main():
             client_labels[client_id].append(1)  # Real
 
     for client_id in range(num_clients):
-        for image, label in zip(client_data[client_id], client_labels[client_id]):
-            server.clients[client_id].add_data(image, label)
+        for image, lbl in zip(client_data[client_id], client_labels[client_id]):
+            server.clients[client_id].add_data(image, lbl)
 
     # Train clients locally
     for client in server.clients:
@@ -224,10 +285,10 @@ def main():
     # Clients share their updates with the server
     updates = server.receive_updates()
 
-    # Server aggregates the updates
+    # Server aggregates the updates, updates global model, and saves it
     server.aggregate_updates(updates)
 
-    # Detect adversarial clients
+    # Detect adversarial clients and compute detection accuracy
     server.detect_adversaries()
 
 if __name__ == "__main__":
