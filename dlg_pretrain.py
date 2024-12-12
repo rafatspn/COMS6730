@@ -6,7 +6,7 @@ import torchvision.transforms as transforms
 import torchvision
 import os
 
-server_model_path = "server_model.pth"
+server_model_path = "real_fake_classifier.pth"
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # ----------------------- DLG Model: Generate Reconstructed Images -----------------------

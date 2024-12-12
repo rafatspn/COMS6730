@@ -6,12 +6,15 @@ from torch.utils.data import Dataset, DataLoader, Subset
 import torchvision.transforms as transforms
 import torchvision
 import random
+from torchvision.utils import save_image
 
 # Configuration
 num_clients = 10
 num_data_per_client = 3
 mode = 'test'
 server_model_path = "server_model.pth"
+reconstructed_folder = "reconstructed_images"
+os.makedirs(reconstructed_folder, exist_ok=True)
 
 # -------------------- DLG Reconstruction Function --------------------
 def deep_leakage_reconstruct(real_image, model, real_label, device, steps=200, lr=0.1):
@@ -34,7 +37,6 @@ def deep_leakage_reconstruct(real_image, model, real_label, device, steps=200, l
         grad_loss.backward()
         optimizer.step()
         scheduler.step()
-        # Shortened for demonstration
 
     return dummy_data.detach()
 
@@ -55,7 +57,14 @@ class SingleImageDataset(Dataset):
             image = self.transform(image)
         return image, label
 
-# ----------------------- Model -----------------------
+# ----------------------- Models -----------------------
+def get_resnet_model(num_classes=10, device='cpu'):
+    model_resnet = torchvision.models.resnet18(pretrained=False)
+    model_resnet.fc = nn.Linear(model_resnet.fc.in_features, num_classes)
+    model_resnet = model_resnet.to(device)
+    return model_resnet
+
+# Use the original RealFakeClassifier structure (CNN-based)
 class RealFakeClassifier(nn.Module):
     def __init__(self):
         super(RealFakeClassifier, self).__init__()
@@ -85,9 +94,9 @@ def train_model(model, dataloader, criterion, optimizer, device, epochs=5):
     for epoch in range(epochs):
         total_loss = 0.0
         for images, labels in dataloader:
-            images, labels = images.to(device), labels.to(device).float()
+            images, labels = images.to(device), labels.to(device).long()
             optimizer.zero_grad()
-            outputs = model(images).squeeze()
+            outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
@@ -109,12 +118,11 @@ class Client:
     def __init__(self, client_id, device):
         self.client_id = client_id
         self.device = device
-        self.model = RealFakeClassifier().to(device)
+        self.model = get_resnet_model(num_classes=10, device=device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-        self.criterion = nn.BCELoss()
+        self.criterion = nn.CrossEntropyLoss()
         self.data = []
         self.labels = []
-        # For detection heuristic
         self.queries = 0
 
     def add_data(self, image, label):
@@ -134,24 +142,19 @@ class Client:
     def get_model_update(self):
         return self.model.state_dict()
 
-    def test(self):
+    def test(self, classifier, device):
         test_images = torch.cat(self.data)
         test_labels = torch.tensor(self.labels)
-        print(f"Testing client {self.client_id}...")
-        test_single_images(self.model, test_images, test_labels, self.device)
-
-    def is_adversarial(self):
-        # Heuristic for DLG-type adversary: If more than half are fake
-        reconstructed_count = sum(label == 0 for label in self.labels)
-        if reconstructed_count > (len(self.labels) / 2):
-            return True
-        # If too many queries without meaningful improvements could also indicate suspicious behavior
-        if self.queries > 50:
-            return True
-        return False
+        print(f"Testing client {self.client_id} using RealFakeClassifier...")
+        classifier.eval()
+        with torch.no_grad():
+            outputs = classifier(test_images.to(device))
+            preds = (outputs.squeeze() > 0.5).float()
+        # Return fraction of fake predictions
+        fake_ratio = (preds == 0).sum().item() / len(preds)
+        return fake_ratio
 
 class MIAClient(Client):
-    # Membership Inference Attacker
     def __init__(self, client_id, device, target_model, population_dataset):
         super().__init__(client_id, device)
         self.target_model = target_model
@@ -159,27 +162,25 @@ class MIAClient(Client):
         self.attack_model = None
 
     def build_shadow_models(self, k=1):
-        # Build a shadow model for demonstration purposes
         n = len(self.population_dataset)
         indices = list(range(n))
         random.shuffle(indices)
         half = n // 2
-        in_indices = indices[:half]   # Shadow training set
-        out_indices = indices[half:]  # Shadow test set
+        in_indices = indices[:half]
+        out_indices = indices[half:]
 
         in_subset = Subset(self.population_dataset, in_indices)
         out_subset = Subset(self.population_dataset, out_indices)
 
-        shadow_model = RealFakeClassifier().to(self.device)
-        criterion = nn.BCELoss()
+        shadow_model = get_resnet_model(num_classes=10, device=self.device)
+        criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(shadow_model.parameters(), lr=0.001)
 
-        # Fake training: label all as real for simplicity
         train_images = []
         train_labels = []
-        for (img, _) in in_subset:
+        for (img, lbl) in in_subset:
             train_images.append(img)
-            train_labels.append(1)
+            train_labels.append(lbl)
         train_dataset = SingleImageDataset(torch.stack(train_images), torch.tensor(train_labels))
         train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
         train_model(shadow_model, train_loader, criterion, optimizer, self.device, epochs=2)
@@ -188,10 +189,12 @@ class MIAClient(Client):
             model.eval()
             X, Y = [], []
             with torch.no_grad():
-                for img, _ in subset:
+                for img, _lbl in subset:
                     img = img.unsqueeze(0).to(self.device)
-                    out = model(img).item()
-                    X.append(out)
+                    out = model(img)
+                    prob = torch.softmax(out, dim=1)
+                    max_conf, _ = torch.max(prob, dim=1)
+                    X.append(max_conf.item())
                     Y.append(1.0 if in_flag else 0.0)
             return X, Y
 
@@ -237,30 +240,19 @@ class MIAClient(Client):
     def perform_mia(self, samples):
         if self.attack_model is None:
             self.train_attack_model()
-        self.queries += len(samples)  # Counting suspicious queries
+        self.queries += len(samples)
         results = []
         self.target_model.eval()
         with torch.no_grad():
             for img, lbl in samples:
                 img = img.unsqueeze(0).to(self.device)
-                out = self.target_model(img).item()
-                attack_input = torch.tensor([[out]]).float().to(self.device)
+                out = self.target_model(img)
+                prob = torch.softmax(out, dim=1)
+                max_conf, _ = torch.max(prob, dim=1)
+                attack_input = max_conf.unsqueeze(1)
                 pred = self.attack_model(attack_input).item()
-                results.append(("in" if pred>0.5 else "out", out))
+                results.append(("in" if pred>0.5 else "out", max_conf.item()))
         return results
-
-    def is_adversarial(self):
-        # For MIA detection heuristic:
-        # If the client made many MIA queries, it might be suspicious.
-        # Combine with parent heuristic for extra conditions.
-        parent_check = super().is_adversarial()
-        if parent_check:
-            return True
-        # If queries exceed some threshold, flag as MIA adversary
-        # This threshold is arbitrary.
-        if self.queries > 20:
-            return True
-        return False
 
 # ----------------------- Server Class -----------------------
 class Server:
@@ -268,28 +260,28 @@ class Server:
         self.num_clients = num_clients
         self.device = device
         self.clients = []
-        self.global_model = RealFakeClassifier().to(device)
+        self.global_model = get_resnet_model(num_classes=10, device=device)
         self.adversary_ids = adversary_ids
         self.mia_ids = mia_ids
+        # If no pre-trained server model found, that's fine; we start from scratch
+        if os.path.exists(server_model_path):
+            self.global_model.load_state_dict(torch.load(server_model_path))
+            print(f"Loaded pre-trained server model from {server_model_path}")
+        else:
+            print("No pre-trained server model found. Starting from scratch.")
         self.server_model_path = server_model_path
 
-        if not os.path.exists(self.server_model_path):
-            raise FileNotFoundError("Pre-trained server model not found.")
-        self.global_model.load_state_dict(torch.load(self.server_model_path))
-        print(f"Loaded pre-trained server model from {self.server_model_path}")
+        # Initialize RealFakeClassifier (untrained or load if desired)
+        self.real_fake_classifier = RealFakeClassifier().to(device)
+        # If you have a pre-trained RealFakeClassifier, you can load it here:
+        if os.path.exists("real_fake_classifier.pth"):
+            self.real_fake_classifier.load_state_dict(torch.load("real_fake_classifier.pth"))
+            print("Loaded pre-trained RealFakeClassifier.")
+        else:
+            print("No pre-trained RealFakeClassifier found, using untrained classifier.")
 
     def add_client(self, client):
         self.clients.append(client)
-
-    def aggregate_updates(self, updates):
-        global_state_dict = self.global_model.state_dict()
-        for key in global_state_dict:
-            global_state_dict[key] = torch.stack([update[key] for update in updates]).mean(dim=0)
-        self.global_model.load_state_dict(global_state_dict)
-
-        # Save updated model
-        torch.save(self.global_model.state_dict(), self.server_model_path)
-        print(f"Updated server model saved to {self.server_model_path}")
 
     def receive_updates(self):
         updates = []
@@ -298,15 +290,36 @@ class Server:
         return updates
 
     def detect_adversaries(self):
+        # Use the RealFakeClassifier to determine which clients are adversarial.
+        # We'll classify each client's data images. If more than half are predicted fake, we consider it adversarial.
         adversarial_clients_detected = []
         for client in self.clients:
-            client.test()
-            if client.is_adversarial():
+            fake_ratio = client.test(self.real_fake_classifier, self.device)
+            # If more than half of a client's images are predicted as fake:
+            if fake_ratio > 0.5:
                 adversarial_clients_detected.append(client.client_id)
                 print(f"Client {client.client_id} detected as adversarial.")
+        return adversarial_clients_detected
 
-        print(f"Adversarial clients detected: {adversarial_clients_detected}")
-        # Evaluate detection accuracy if ground truth known
+    def aggregate_updates(self, updates, adversarial_clients):
+        # Exclude adversarial clients from aggregation
+        filtered_updates = [updates[i] for i in range(len(updates)) if self.clients[i].client_id not in adversarial_clients]
+
+        if len(filtered_updates) == 0:
+            print("No real updates found. Skipping aggregation.")
+            return
+
+        global_state_dict = self.global_model.state_dict()
+        for key in global_state_dict:
+            # global_state_dict[key] = torch.stack([u[key] for u in filtered_updates]).mean(dim=0)
+            global_state_dict[key] = torch.stack([u[key].float() for u in filtered_updates]).mean(dim=0)
+
+        self.global_model.load_state_dict(global_state_dict)
+
+        torch.save(self.global_model.state_dict(), self.server_model_path)
+        print(f"Updated server model saved to {self.server_model_path}")
+
+    def save_results(self, adversarial_clients_detected):
         ground_truth = self.adversary_ids + self.mia_ids
         tp = sum(1 for cid in adversarial_clients_detected if cid in ground_truth)
         fp = sum(1 for cid in adversarial_clients_detected if cid not in ground_truth)
@@ -314,14 +327,14 @@ class Server:
         tn = self.num_clients - (tp + fp + fn)
         accuracy = (tp + tn) / self.num_clients
         accuracy_str = f"Adversary Detection Accuracy: {accuracy * 100:.2f}%"
-        print(f"Adversary Detection Accuracy: {accuracy*100:.2f}%")
+        print(accuracy_str)
 
-        # Save results to a text file
         with open("results.txt", "w") as f:
-            f.write(f"Ground Truth Adversaries: {self.adversary_ids}\n")
+            f.write(f"Ground Truth Adversaries: {ground_truth}\n")
             f.write(f"Detected Adversaries: {adversarial_clients_detected}\n")
-            f.write(f"TP: {tp}, FP: {fp}, FN: {fn}, TN: {tn}\n")   
+            f.write(f"TP: {tp}, FP: {fp}, FN: {fn}, TN: {tn}\n")
             f.write(accuracy_str + "\n")
+
 
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -333,25 +346,20 @@ def main():
     dataset = torchvision.datasets.MNIST(root="./data", train=True, download=True, transform=transform)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
-    # Initialize server
     server = Server(num_clients, device, adversary_ids, mia_ids, server_model_path)
 
-    # Create clients
     clients = []
     for i in range(num_clients):
         if i in mia_ids:
-            # MIA client: needs population dataset (use MNIST test set)
             test_dataset = torchvision.datasets.MNIST(root="./data", train=False, download=True, transform=transform)
             client = MIAClient(i, device, server.global_model, test_dataset)
         else:
             client = Client(i, device)
         clients.append(client)
 
-    # Add clients to server
     for c in clients:
         server.add_client(c)
 
-    # Distribute data
     iter_data = iter(dataloader)
     for i in range(num_clients * num_data_per_client):
         client_id = i // num_data_per_client
@@ -359,36 +367,40 @@ def main():
         real_image, label = real_image.to(device), label.to(device)
 
         if client_id in adversary_ids:
-            # Adversary using DLG
-            model_resnet = torchvision.models.resnet18(pretrained=False)
-            model_resnet.fc = nn.Linear(model_resnet.fc.in_features, 10)
-            model_resnet.to(device).eval()
+            # DLG adversary
+            model_resnet = get_resnet_model(num_classes=10, device=device).eval()
             fake_image = deep_leakage_reconstruct(real_image, model_resnet, label, device)
-            clients[client_id].add_data(fake_image.cpu(), 0)  # Fake label
+            # Save reconstructed image
+            save_image(fake_image, os.path.join(reconstructed_folder, f"client_{client_id}_image_{i}.png"))
+            # Label fake images as '0' (fake) for ground truth
+            clients[client_id].add_data(fake_image.cpu(), 0)
         else:
-            clients[client_id].add_data(real_image.cpu(), 1)  # Real label
+            # Real images labeled as '1'
+            clients[client_id].add_data(real_image.cpu(), 1)
 
-    # MIA attackers perform queries before training (just for demonstration)
+    # MIA attackers perform queries
     for cid in mia_ids:
         samples = []
         for _ in range(21):
             idx = random.randint(0, len(dataset)-1)
-            samples.append(dataset[idx])  # (img, lbl)
+            samples.append(dataset[idx])
         results = clients[cid].perform_mia(samples)
         print(f"MIA Client {cid} MIA results:", results)
 
-    # Train clients locally
+    # Train clients
     for client in clients:
         client.train(epochs=2)  # fewer epochs for demonstration
 
-    # Clients share their updates with the server
+    # Receive updates
     updates = server.receive_updates()
 
-    # Server aggregates the updates
-    server.aggregate_updates(updates)
+    # Detect adversaries and aggregate updates
+    adversarial_clients_detected = server.detect_adversaries()
+    server.aggregate_updates(updates, adversarial_clients_detected)
 
-    # Detect adversarial clients
-    server.detect_adversaries()
+    # Save detection results
+    server.save_results(adversarial_clients_detected)
+
 
 if __name__ == "__main__":
     main()
