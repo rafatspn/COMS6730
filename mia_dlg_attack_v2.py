@@ -40,6 +40,82 @@ def deep_leakage_reconstruct(real_image, model, real_label, device, steps=200, l
 
     return dummy_data.detach()
 
+def total_variation_loss(img, tv_weight=1e-4):
+    """
+    Computes the total variation loss, encouraging spatial smoothness.
+    img is assumed to be of shape [B, C, H, W].
+    """
+    diff_x = img[:, :, :, 1:] - img[:, :, :, :-1]
+    diff_y = img[:, :, 1:, :] - img[:, :, :-1, :]
+    tv_loss = (diff_x.abs().mean() + diff_y.abs().mean()) * tv_weight
+    return tv_loss
+
+def improved_deep_leakage_reconstruct(real_image, real_label, model, device, steps=500, lr=0.1, tv_weight=1e-4, weight_decay=1e-5, restarts=1):
+    """
+    An improved version of the deep leakage from gradients reconstruction.
+
+    Args:
+        real_image (torch.Tensor): The true image that was used as input.
+        real_label (torch.Tensor): The label corresponding to the real_image.
+        model (nn.Module): The model for which we have gradients.
+        device (torch.device): Device to run on.
+        steps (int): Number of optimization steps.
+        lr (float): Initial learning rate.
+        tv_weight (float): Weight for total variation regularization.
+        weight_decay (float): Weight decay to regularize pixel values.
+        restarts (int): Number of random restarts to try.
+
+    Returns:
+        torch.Tensor: The reconstructed image.
+    """
+
+    model.eval()
+    criterion = nn.CrossEntropyLoss()
+
+    # Compute gradients for the real image and label
+    real_output = model(real_image)
+    real_loss = criterion(real_output, real_label)
+    real_grad = torch.autograd.grad(real_loss, model.parameters(), create_graph=False)
+
+    best_loss = float('inf')
+    best_img = None
+
+    # Try multiple restarts to find a better initial point
+    for attempt in range(restarts):
+        # Initialize dummy_data with a normal distribution
+        dummy_data = torch.randn_like(real_image, requires_grad=True, device=device)
+
+        optimizer = optim.Adam([dummy_data], lr=lr, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
+
+        for step in range(steps):
+            optimizer.zero_grad()
+
+            dummy_output = model(dummy_data)
+            dummy_loss = criterion(dummy_output, real_label)
+            dummy_grad = torch.autograd.grad(dummy_loss, model.parameters(), create_graph=False)
+
+            # Gradient matching loss
+            grad_loss = sum((dg - rg).pow(2).sum() for dg, rg in zip(dummy_grad, real_grad))
+
+            # Add total variation loss for smoothness
+            tv_loss_val = total_variation_loss(dummy_data, tv_weight=tv_weight)
+
+            total_loss = grad_loss + tv_loss_val
+            total_loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+        # Check if this attempt is the best so far
+        final_loss_val = total_loss.item()
+        if final_loss_val < best_loss:
+            best_loss = final_loss_val
+            best_img = dummy_data.detach().clone()
+
+    return best_img
+
+
+
 # ----------------------- Dataset -----------------------
 class SingleImageDataset(Dataset):
     def __init__(self, images, labels, transform=None):
@@ -161,104 +237,47 @@ class MIAClient(Client):
         self.population_dataset = population_dataset
         self.attack_model = None
 
-    # def build_shadow_models(self, k=1):
-    #     n = len(self.population_dataset)
-    #     indices = list(range(n))
-    #     random.shuffle(indices)
-    #     half = n // 2
-    #     in_indices = indices[:half]
-    #     out_indices = indices[half:]
-
-    #     in_subset = Subset(self.population_dataset, in_indices)
-    #     out_subset = Subset(self.population_dataset, out_indices)
-
-    #     shadow_model = get_resnet_model(num_classes=10, device=self.device)
-    #     criterion = nn.CrossEntropyLoss()
-    #     optimizer = optim.Adam(shadow_model.parameters(), lr=0.001)
-
-    #     train_images = []
-    #     train_labels = []
-    #     for (img, lbl) in in_subset:
-    #         train_images.append(img)
-    #         train_labels.append(lbl)
-    #     train_dataset = SingleImageDataset(torch.stack(train_images), torch.tensor(train_labels))
-    #     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-    #     train_model(shadow_model, train_loader, criterion, optimizer, self.device, epochs=2)
-
-    #     def get_attack_data(model, subset, in_flag):
-    #         model.eval()
-    #         X, Y = [], []
-    #         with torch.no_grad():
-    #             for img, _lbl in subset:
-    #                 img = img.unsqueeze(0).to(self.device)
-    #                 out = model(img)
-    #                 prob = torch.softmax(out, dim=1)
-    #                 max_conf, _ = torch.max(prob, dim=1)
-    #                 X.append(max_conf.item())
-    #                 Y.append(1.0 if in_flag else 0.0)
-    #         return X, Y
-
-    #     inX, inY = get_attack_data(shadow_model, in_subset, True)
-    #     outX, outY = get_attack_data(shadow_model, out_subset, False)
-
-    #     return inX, inY, outX, outY
-
-    def build_shadow_models(self, k=3):
-        # Initialize lists to accumulate data from multiple shadow models
-        inX_total, inY_total = [], []
-        outX_total, outY_total = [], []
-
+    def build_shadow_models(self, k=1):
         n = len(self.population_dataset)
-        for _ in range(k):
-            indices = list(range(n))
-            random.shuffle(indices)
-            half = n // 2
-            in_indices = indices[:half]
-            out_indices = indices[half:]
+        indices = list(range(n))
+        random.shuffle(indices)
+        half = n // 2
+        in_indices = indices[:half]
+        out_indices = indices[half:]
 
-            in_subset = Subset(self.population_dataset, in_indices)
-            out_subset = Subset(self.population_dataset, out_indices)
+        in_subset = Subset(self.population_dataset, in_indices)
+        out_subset = Subset(self.population_dataset, out_indices)
 
-            shadow_model = get_resnet_model(num_classes=10, device=self.device)
-            criterion = nn.CrossEntropyLoss()
-            optimizer = torch.optim.Adam(shadow_model.parameters(), lr=0.001)
+        shadow_model = get_resnet_model(num_classes=10, device=self.device)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(shadow_model.parameters(), lr=0.001)
 
-            train_images = []
-            train_labels = []
-            for (img, lbl) in in_subset:
-                train_images.append(img)
-                train_labels.append(lbl)
+        train_images = []
+        train_labels = []
+        for (img, lbl) in in_subset:
+            train_images.append(img)
+            train_labels.append(lbl)
+        train_dataset = SingleImageDataset(torch.stack(train_images), torch.tensor(train_labels))
+        train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+        train_model(shadow_model, train_loader, criterion, optimizer, self.device, epochs=2)
 
-            train_dataset = SingleImageDataset(torch.stack(train_images), torch.tensor(train_labels))
-            train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-            train_model(shadow_model, train_loader, criterion, optimizer, self.device, epochs=2)
+        def get_attack_data(model, subset, in_flag):
+            model.eval()
+            X, Y = [], []
+            with torch.no_grad():
+                for img, _lbl in subset:
+                    img = img.unsqueeze(0).to(self.device)
+                    out = model(img)
+                    prob = torch.softmax(out, dim=1)
+                    max_conf, _ = torch.max(prob, dim=1)
+                    X.append(max_conf.item())
+                    Y.append(1.0 if in_flag else 0.0)
+            return X, Y
 
-            def get_attack_data(model, subset, in_flag):
-                model.eval()
-                X, Y = [], []
-                with torch.no_grad():
-                    for img, _lbl in subset:
-                        img = img.unsqueeze(0).to(self.device)
-                        out = model(img)
-                        prob = torch.softmax(out, dim=1)
-                        max_conf, _ = torch.max(prob, dim=1)
-                        X.append(max_conf.item())
-                        Y.append(1.0 if in_flag else 0.0)
-                return X, Y
+        inX, inY = get_attack_data(shadow_model, in_subset, True)
+        outX, outY = get_attack_data(shadow_model, out_subset, False)
 
-            inX, inY = get_attack_data(shadow_model, in_subset, True)
-            outX, outY = get_attack_data(shadow_model, out_subset, False)
-
-            # Accumulate data
-            inX_total.extend(inX)
-            inY_total.extend(inY)
-            outX_total.extend(outX)
-            outY_total.extend(outY)
-
-        # Return all accumulated data from k shadow models
-        return inX_total, inY_total, outX_total, outY_total
-
-
+        return inX, inY, outX, outY
 
     def train_attack_model(self):
         inX, inY, outX, outY = self.build_shadow_models()
@@ -302,7 +321,8 @@ class MIAClient(Client):
         self.target_model.eval()
         with torch.no_grad():
             for img, lbl in samples:
-                img = img.unsqueeze(0).to(self.device)
+                # img = img.unsqueeze(0).to(self.device)
+                img = img.to(self.device)
                 out = self.target_model(img)
                 prob = torch.softmax(out, dim=1)
                 max_conf, _ = torch.max(prob, dim=1)
@@ -400,72 +420,51 @@ class Server:
             f.write(f"TP: {tp}, FP: {fp}, FN: {fn}, TN: {tn}\n")
             f.write(accuracy_str + "\n")
 
-
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    adversary_ids = [2]      # DLG adversary
-    mia_ids = [3]            # MIA adversary
 
     transform = transforms.Compose([transforms.Resize((32, 32)), transforms.Grayscale(3), transforms.ToTensor()])
     dataset = torchvision.datasets.MNIST(root="./data", train=True, download=True, transform=transform)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
-    server = Server(num_clients, device, adversary_ids, mia_ids, server_model_path)
+    # Initialize the target model
+    target_model = get_resnet_model(num_classes=10, device=device)
+    target_model.load_state_dict(torch.load(server_model_path))
+    target_model.eval()
 
-    clients = []
-    for i in range(num_clients):
-        if i in mia_ids:
-            test_dataset = torchvision.datasets.MNIST(root="./data", train=False, download=True, transform=transform)
-            client = MIAClient(i, device, server.global_model, test_dataset)
-        else:
-            client = Client(i, device)
-        clients.append(client)
+    # Initialize the MIA client to train the attack model
+    mia_client = MIAClient(99, device, target_model, dataset)
+    mia_client.train_attack_model()
 
-    for c in clients:
-        server.add_client(c)
+    # Initialize the server with RealFakeClassifier
+    server = Server(num_clients, device, [], [], server_model_path)
 
+    # Generate reconstructed images using DLG
     iter_data = iter(dataloader)
     for i in range(num_clients * num_data_per_client):
-        client_id = i // num_data_per_client
         (real_image, label) = next(iter_data)
         real_image, label = real_image.to(device), label.to(device)
 
-        if client_id in adversary_ids:
-            # DLG adversary
-            model_resnet = get_resnet_model(num_classes=10, device=device).eval()
-            fake_image = deep_leakage_reconstruct(real_image, model_resnet, label, device)
-            # Save reconstructed image
-            save_image(fake_image, os.path.join(reconstructed_folder, f"client_{client_id}_image_{i}.png"))
-            # Label fake images as '0' (fake) for ground truth
-            clients[client_id].add_data(fake_image.cpu(), 0)
-        else:
-            # Real images labeled as '1'
-            clients[client_id].add_data(real_image.cpu(), 1)
+        # DLG adversary
+        model_resnet = get_resnet_model(num_classes=10, device=device).eval()
+        # fake_image = deep_leakage_reconstruct(real_image, model_resnet, label, device)
+        fake_image = improved_deep_leakage_reconstruct(real_image, label, model_resnet, device, steps=500, lr=0.1, tv_weight=1e-4, weight_decay=1e-5, restarts=3)
+        # Save reconstructed image
+        save_image(fake_image, os.path.join(reconstructed_folder, f"reconstructed_image_{i}.png"))
 
-    # MIA attackers perform queries
-    for cid in mia_ids:
-        samples = []
-        for _ in range(21):
-            idx = random.randint(0, len(dataset)-1)
-            samples.append(dataset[idx])
-        results = clients[cid].perform_mia(samples)
-        print(f"MIA Client {cid} MIA results:", results)
+        # Use the trained MIA attack model to classify the reconstructed image
+        result = mia_client.perform_mia([(fake_image.cpu(), label.cpu())])
+        print(f"MIA result for reconstructed image {i}: {result}")
 
-    # Train clients
-    for client in clients:
-        client.train(epochs=2)  # fewer epochs for demonstration
+        # Use the RealFakeClassifier to classify the reconstructed image
+        real_fake_result = server.real_fake_classifier(fake_image.to(device)).item()
+        print(f"RealFakeClassifier result for reconstructed image {i}: {'Real' if real_fake_result > 0.5 else 'Reconstructed'}")
 
-    # Receive updates
-    updates = server.receive_updates()
-
-    # Detect adversaries and aggregate updates
-    adversarial_clients_detected = server.detect_adversaries()
-    server.aggregate_updates(updates, adversarial_clients_detected)
-
-    # Save detection results
-    server.save_results(adversarial_clients_detected)
-
+        # If the attack model classifies the constructed image as a member of the target model
+        if result[0][0] == "in" and real_fake_result > 0.5:
+            # Send the constructed image to the target model
+            print(f"Sending reconstructed image {i} to the target model")
+            # Here you would send the image to the target model for further processing
 
 if __name__ == "__main__":
     main()
