@@ -169,6 +169,8 @@ def main():
         test_fake_images_list.append(fake_img.cpu())
         test_fake_labels_list.append(torch.tensor([0])) # fake label = 0
 
+
+
     test_real_images = torch.cat([x.cpu() for x in test_real_images_list], dim=0)
     test_real_labels = torch.ones(len(test_real_images_list))  # label 1 for real
 

@@ -17,7 +17,7 @@ reconstructed_folder = "reconstructed_images"
 os.makedirs(reconstructed_folder, exist_ok=True)
 
 # -------------------- DLG Reconstruction Function --------------------
-def deep_leakage_reconstruct(real_image, model, real_label, device, steps=200, lr=0.1):
+def deep_leakage_reconstruct(real_gradients, real_label, model, device, steps=200, lr=0.1):
     dummy_data = torch.rand_like(real_image, requires_grad=True, device=device)
     optimizer = optim.Adam([dummy_data], lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
@@ -39,7 +39,6 @@ def deep_leakage_reconstruct(real_image, model, real_label, device, steps=200, l
         scheduler.step()
 
     return dummy_data.detach()
-
 
 # ----------------------- Dataset -----------------------
 class SingleImageDataset(Dataset):
@@ -69,23 +68,14 @@ def get_resnet_model(num_classes=10, device='cpu'):
 class RealFakeClassifier(nn.Module):
     def __init__(self):
         super(RealFakeClassifier, self).__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(3, 16, 3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(16, 32, 3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-        )
         self.fc = nn.Sequential(
-            nn.Linear(32 * 8 * 8, 128),
+            nn.Linear(1000, 128),
             nn.ReLU(),
             nn.Linear(128, 1),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        x = self.cnn(x)
         x = x.view(x.size(0), -1)
         x = self.fc(x)
         return x
@@ -143,13 +133,25 @@ class Client:
     def get_model_update(self):
         return self.model.state_dict()
 
+    def get_gradients(self):
+        gradients = []
+        for image, label in zip(self.data, self.labels):
+            image = image.unsqueeze(0).to(self.device)
+            label = torch.tensor([label]).to(self.device)
+            self.model.zero_grad()
+            output = self.model(image)
+            loss = self.criterion(output, label)
+            loss.backward()
+            gradients.append([param.grad.clone() for param in self.model.parameters()])
+        return gradients
+
     def test(self, classifier, device):
-        test_images = torch.cat(self.data)
-        test_labels = torch.tensor(self.labels)
+        gradients = self.get_gradients()
+        test_gradients = torch.cat([torch.cat([g.view(-1) for g in grad]) for grad in gradients]).unsqueeze(0)
         print(f"Testing client {self.client_id} using RealFakeClassifier...")
         classifier.eval()
         with torch.no_grad():
-            outputs = classifier(test_images.to(device))
+            outputs = classifier(test_gradients.to(device))
             preds = (outputs.squeeze() > 0.5).float()
         # Return fraction of fake predictions
         fake_ratio = (preds == 0).sum().item() / len(preds)
@@ -161,48 +163,6 @@ class MIAClient(Client):
         self.target_model = target_model
         self.population_dataset = population_dataset
         self.attack_model = None
-
-    # def build_shadow_models(self, k=1):
-    #     n = len(self.population_dataset)
-    #     indices = list(range(n))
-    #     random.shuffle(indices)
-    #     half = n // 2
-    #     in_indices = indices[:half]
-    #     out_indices = indices[half:]
-
-    #     in_subset = Subset(self.population_dataset, in_indices)
-    #     out_subset = Subset(self.population_dataset, out_indices)
-
-    #     shadow_model = get_resnet_model(num_classes=10, device=self.device)
-    #     criterion = nn.CrossEntropyLoss()
-    #     optimizer = optim.Adam(shadow_model.parameters(), lr=0.001)
-
-    #     train_images = []
-    #     train_labels = []
-    #     for (img, lbl) in in_subset:
-    #         train_images.append(img)
-    #         train_labels.append(lbl)
-    #     train_dataset = SingleImageDataset(torch.stack(train_images), torch.tensor(train_labels))
-    #     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-    #     train_model(shadow_model, train_loader, criterion, optimizer, self.device, epochs=2)
-
-    #     def get_attack_data(model, subset, in_flag):
-    #         model.eval()
-    #         X, Y = [], []
-    #         with torch.no_grad():
-    #             for img, _lbl in subset:
-    #                 img = img.unsqueeze(0).to(self.device)
-    #                 out = model(img)
-    #                 prob = torch.softmax(out, dim=1)
-    #                 max_conf, _ = torch.max(prob, dim=1)
-    #                 X.append(max_conf.item())
-    #                 Y.append(1.0 if in_flag else 0.0)
-    #         return X, Y
-
-    #     inX, inY = get_attack_data(shadow_model, in_subset, True)
-    #     outX, outY = get_attack_data(shadow_model, out_subset, False)
-
-    #     return inX, inY, outX, outY
 
     def build_shadow_models(self, k=3):
         # Initialize lists to accumulate data from multiple shadow models
@@ -258,8 +218,6 @@ class MIAClient(Client):
 
         # Return all accumulated data from k shadow models
         return inX_total, inY_total, outX_total, outY_total
-
-
 
     def train_attack_model(self):
         inX, inY, outX, outY = self.build_shadow_models()
@@ -349,11 +307,11 @@ class Server:
 
     def detect_adversaries(self):
         # Use the RealFakeClassifier to determine which clients are adversarial.
-        # We'll classify each client's data images. If more than half are predicted fake, we consider it adversarial.
+        # We'll classify each client's gradients. If more than half are predicted fake, we consider it adversarial.
         adversarial_clients_detected = []
         for client in self.clients:
             fake_ratio = client.test(self.real_fake_classifier, self.device)
-            # If more than half of a client's images are predicted as fake:
+            # If more than half of a client's gradients are predicted as fake:
             if fake_ratio > 0.5:
                 adversarial_clients_detected.append(client.client_id)
                 print(f"Client {client.client_id} detected as adversarial.")
@@ -401,7 +359,6 @@ class Server:
             f.write(f"TP: {tp}, FP: {fp}, FN: {fn}, TN: {tn}\n")
             f.write(accuracy_str + "\n")
 
-
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -432,17 +389,6 @@ def main():
         (real_image, label) = next(iter_data)
         real_image, label = real_image.to(device), label.to(device)
 
-        # if client_id in adversary_ids:
-        #     # DLG adversary
-        #     model_resnet = get_resnet_model(num_classes=10, device=device).eval()
-        #     fake_image = deep_leakage_reconstruct(real_image, model_resnet, label, device)
-        #     # Save reconstructed image
-        #     save_image(fake_image, os.path.join(reconstructed_folder, f"client_{client_id}_image_{i}.png"))
-        #     # Label fake images as '0' (fake) for ground truth
-        #     clients[client_id].add_data(fake_image.cpu(), 0)
-        # else:
-        #     # Real images labeled as '1'
-        #     clients[client_id].add_data(real_image.cpu(), 1)
         if client_id in adversary_ids:
             # Compute real gradients from real data
             model_resnet = get_resnet_model(num_classes=10, device=device).eval()
@@ -461,10 +407,6 @@ def main():
 
             # Label fake images as '0' (fake) for ground truth
             clients[client_id].add_data(fake_image.cpu(), 0)
-
-
-
-    
 
     # MIA attackers perform queries
     for cid in mia_ids:
@@ -488,7 +430,6 @@ def main():
 
     # Save detection results
     server.save_results(adversarial_clients_detected)
-
 
 if __name__ == "__main__":
     main()
