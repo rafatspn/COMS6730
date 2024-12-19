@@ -15,16 +15,19 @@ class Client:
         self.train_loader = train_loader
         self.device = device
         self.model = models.resnet18(pretrained=False, num_classes=10)  # 10 classes for MNIST
-        self.model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)  # Adjust for 1-channel MNIST
+        self.model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)  # Adjust for MNIST
         self.model.to(self.device)
 
     def local_train(self, global_weights, epochs=1, lr=0.01):
-        """Train the ResNet-18 locally."""
-        self.model.load_state_dict(global_weights)  # Load global weights
+        """Train the ResNet-18 locally and return gradient differences."""
+        # Load global weights
+        self.model.load_state_dict(global_weights)
         self.model.train()
 
         optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=0.9)
         criterion = nn.CrossEntropyLoss()
+
+        initial_weights = copy.deepcopy(global_weights)
 
         for epoch in range(epochs):
             for images, labels in self.train_loader:
@@ -35,42 +38,84 @@ class Client:
                 loss.backward()
                 optimizer.step()
 
-        # Return updated model weights
-        return copy.deepcopy(self.model.state_dict())
+        # Calculate weight differences
+        updated_weights = self.model.state_dict()
+        gradient_diffs = {k: (updated_weights[k] - initial_weights[k]) for k in updated_weights.keys()}
 
-# ------------------ Federated Averaging ---------------------
-def fed_avg(client_weights):
-    """Average the model weights from clients."""
-    avg_weights = copy.deepcopy(client_weights[0])
-    for key in avg_weights.keys():
-        for i in range(1, len(client_weights)):
-            avg_weights[key] += client_weights[i][key]
-        avg_weights[key] = torch.div(avg_weights[key], len(client_weights))
-    return avg_weights
+        return gradient_diffs
 
-# ------------------ Federated Learning ---------------------
-def federated_learning(clients, global_model, rounds=5, epochs=1, lr=0.01):
-    """Federated Learning process."""
-    global_weights = global_model.state_dict()
+# ------------------ Server Class ---------------------
+class Server:
+    def __init__(self, model, clients, threshold_factor=1.5, device="cpu"):
+        self.model = model
+        self.clients = clients
+        self.threshold_factor = threshold_factor
+        self.device = device
+        self.global_weights = self.model.state_dict()
 
-    for round_num in range(1, rounds + 1):
-        print(f"\n--- Round {round_num} ---")
-        local_weights = []
+    @staticmethod
+    def calculate_gradient_norm(gradients):
+        """Calculate the L2 norm of gradients, ensuring tensors are float32."""
+        total_norm = 0.0
+        for grad in gradients.values():
+            total_norm += torch.norm(grad.float()).item() ** 2  # Ensure float32
+        return total_norm ** 0.5
 
-        for client in clients:
-            print(f"Client {client.client_id} training...")
-            local_w = client.local_train(global_weights, epochs=epochs, lr=lr)
-            local_weights.append(local_w)
+    def aggregate_gradients(self, client_gradients):
+        """Perform anomaly detection and aggregate valid gradients."""
+        # Calculate gradient norms
+        norms = [self.calculate_gradient_norm(grads) for grads in client_gradients]
+        mean_norm = sum(norms) / len(norms)
+        threshold = mean_norm * self.threshold_factor
 
-        # Aggregate weights using FedAvg
-        global_weights = fed_avg(local_weights)
+        print(f"Mean Gradient Norm: {mean_norm:.4f}, Threshold: {threshold:.4f}")
 
-        # Update global model
-        global_model.load_state_dict(global_weights)
-        print(f"Round {round_num} completed. Global model updated.\n")
+        # Filter valid gradients
+        valid_gradients = [
+            grads for grads, norm in zip(client_gradients, norms) if norm <= threshold
+        ]
 
-    print("Federated Learning Completed!")
-    return global_model
+        print(f"{len(valid_gradients)} out of {len(client_gradients)} clients passed anomaly detection.")
+
+        # Aggregate valid gradients
+        aggregated_gradients = copy.deepcopy(valid_gradients[0])
+        for key in aggregated_gradients.keys():
+            for i in range(1, len(valid_gradients)):
+                aggregated_gradients[key] += valid_gradients[i][key]
+            aggregated_gradients[key] = torch.div(aggregated_gradients[key], len(valid_gradients))
+
+        # Ensure global weights are updated correctly as float32
+        for key in self.global_weights.keys():
+            self.global_weights[key] = self.global_weights[key].float()
+            self.global_weights[key] += aggregated_gradients[key].float()
+
+        return self.global_weights
+
+
+    def federated_training(self, rounds=5, epochs=1, lr=0.01):
+        """Run federated learning rounds."""
+        for round_num in range(1, rounds + 1):
+            print(f"\n--- Round {round_num} ---")
+            client_gradients = []
+
+            # Send global weights to clients and get their updates
+            for client in self.clients:
+                print(f"Client {client.client_id} training...")
+                gradient_diff = client.local_train(self.global_weights, epochs=epochs, lr=lr)
+                client_gradients.append(gradient_diff)
+
+            # Perform aggregation with anomaly detection
+            aggregated_gradients = self.aggregate_gradients(client_gradients)
+
+            # Update global weights
+            for key in self.global_weights.keys():
+                self.global_weights[key] += aggregated_gradients[key]
+
+            self.model.load_state_dict(self.global_weights)
+            print(f"Round {round_num} completed. Global model updated.\n")
+
+        print("Federated Learning Completed!")
+        return self.model
 
 # ------------------ Main Program ---------------------
 if __name__ == "__main__":
@@ -80,6 +125,7 @@ if __name__ == "__main__":
     EPOCHS = 2
     LR = 0.01
     BATCH_SIZE = 32
+    THRESHOLD_FACTOR = 1.5  # Factor for anomaly detection threshold
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Transformations for MNIST dataset
@@ -106,9 +152,10 @@ if __name__ == "__main__":
     global_model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)  # Adjust for MNIST's 1-channel input
     global_model.to(DEVICE)
 
-    # Start Federated Learning
-    final_model = federated_learning(clients, global_model, rounds=ROUNDS, epochs=EPOCHS, lr=LR)
+    # Initialize Server and Start Federated Learning
+    server = Server(model=global_model, clients=clients, threshold_factor=THRESHOLD_FACTOR, device=DEVICE)
+    final_model = server.federated_training(rounds=ROUNDS, epochs=EPOCHS, lr=LR)
 
     # Save the final global model
-    torch.save(final_model.state_dict(), "federated_resnet18_mnist.pth")
-    print("Final model saved as 'federated_resnet18_mnist.pth'")
+    torch.save(final_model.state_dict(), "federated_resnet18_mnist_with_anomaly_server.pth")
+    print("Final model saved as 'federated_resnet18_mnist_with_anomaly_server.pth'")
