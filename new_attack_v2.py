@@ -15,6 +15,26 @@ from sklearn.decomposition import PCA
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+def get_resnet_model(num_classes=10, device='cpu'):
+    model_resnet = torchvision.models.resnet18(pretrained=False)
+    model_resnet.fc = nn.Linear(model_resnet.fc.in_features, num_classes)
+    model_resnet = model_resnet.to(device)
+    return model_resnet
+
+def train_model(model, dataloader, criterion, optimizer, device, epochs=5):
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for images, labels in dataloader:
+            images, labels = images.to(device), labels.to(device).long()
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch [{epoch+1}/{epochs}], Loss: {total_loss / len(dataloader):.4f}")
+
 # ------------------ Pretraining Function ---------------------
 def pretrain_global_model(model, train_loader, device, epochs=3, lr=0.01):
     """Pretrain the global model on MNIST."""
@@ -94,29 +114,120 @@ class MaliciousClient(Client):
         super().__init__(client_id, mnist_loader, initial_weights, device)
         self.fashion_loader = fashion_loader
         self.mnist_loader = mnist_loader
-        self.generator = self.initialize_generator()
+        self.population = ""
+        self.model = models.resnet18(pretrained=False, num_classes=10)  # Use default 3-channel input
+        self.model.load_state_dict(initial_weights)
+        self.attack_model = None
+    
+    def build_shadow_models(self, k=3):
+        # Initialize lists to accumulate data from multiple shadow models
+        inX_total, inY_total = [], []
+        outX_total, outY_total = [], []
 
-    def initialize_generator(self):
-        """Initialize a simple generator network."""
-        class Generator(nn.Module):
-            def __init__(self, latent_dim, img_shape):
-                super(Generator, self).__init__()
-                self.model = nn.Sequential(
-                    nn.Linear(latent_dim, 128),
-                    nn.ReLU(),
-                    nn.Linear(128, 256),
-                    nn.ReLU(),
-                    nn.Linear(256, img_shape[0] * img_shape[1] * img_shape[2]),
-                    nn.Tanh(),
-                )
-                self.img_shape = img_shape
+        if self.population == "mnist":
+            self.population_dataset =  MNIST(root="./data", train=True, download=True, transform=transform)   
+        else:
+            self.population_dataset = FashionMNIST(root="./data", train=True, download=True, transform=transform)
 
-            def forward(self, z):
-                img = self.model(z)
-                return img.view(img.size(0), *self.img_shape)
+        n = len(self.population_dataset)
+        for _ in range(k):
+            indices = list(range(n))
+            random.shuffle(indices)
+            half = n // 2
+            in_indices = indices[:half]
+            out_indices = indices[half:]
 
-        img_shape = (1, 64, 64)
-        return Generator(latent_dim=100, img_shape=img_shape).to(self.device)
+            in_subset = Subset(self.population_dataset, in_indices)
+            out_subset = Subset(self.population_dataset, out_indices)
+
+            shadow_model = get_resnet_model(num_classes=10, device=self.device)
+            criterion = nn.CrossEntropyLoss()
+            optimizer = torch.optim.Adam(shadow_model.parameters(), lr=0.001)
+
+            train_images = []
+            train_labels = []
+            for (img, lbl) in in_subset:
+                train_images.append(img)
+                train_labels.append(lbl)
+
+            train_loader = self.mnist_loader
+            train_model(shadow_model, train_loader, criterion, optimizer, self.device, epochs=2)
+
+            def get_attack_data(model, subset, in_flag):
+                model.eval()
+                X, Y = [], []
+                with torch.no_grad():
+                    for img, _lbl in subset:
+                        img = img.unsqueeze(0).to(self.device)
+                        out = model(img)
+                        prob = torch.softmax(out, dim=1)
+                        max_conf, _ = torch.max(prob, dim=1)
+                        X.append(max_conf.item())
+                        Y.append(1.0 if in_flag else 0.0)
+                return X, Y
+
+            inX, inY = get_attack_data(shadow_model, in_subset, True)
+            outX, outY = get_attack_data(shadow_model, out_subset, False)
+
+            # Accumulate data
+            inX_total.extend(inX)
+            inY_total.extend(inY)
+            outX_total.extend(outX)
+            outY_total.extend(outY)
+
+        # Return all accumulated data from k shadow models
+        return inX_total, inY_total, outX_total, outY_total
+
+    def train_attack_model(self):
+        inX, inY, outX, outY = self.build_shadow_models()
+
+        X = inX + outX
+        Y = inY + outY
+
+        X = torch.tensor(X).unsqueeze(1)
+        Y = torch.tensor(Y)
+
+        attack_dataset = torch.utils.data.TensorDataset(X, Y)
+        attack_loader = DataLoader(attack_dataset, batch_size=4, shuffle=True)
+
+        self.attack_model = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.ReLU(),
+            nn.Linear(16,1),
+            nn.Sigmoid()
+        ).to(self.device)
+        criterion = nn.BCELoss()
+        optimizer = optim.Adam(self.attack_model.parameters(), lr=0.001)
+
+        print("Training attack model (MIA)...")
+        for epoch in range(5):
+            total_loss = 0.0
+            for bx, by in attack_loader:
+                bx, by = bx.to(self.device).float(), by.to(self.device).float()
+                optimizer.zero_grad()
+                pred = self.attack_model(bx).squeeze()
+                loss = criterion(pred, by)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            print(f"Attack Model Epoch [{epoch+1}/5], Loss: {total_loss/len(attack_loader):.4f}")
+
+    # def perform_mia(self, samples):
+    #     if self.attack_model is None:
+    #         self.train_attack_model()
+    #     self.queries += len(samples)
+    #     results = []
+    #     self.target_model.eval()
+    #     with torch.no_grad():
+    #         for img, lbl in samples:
+    #             img = img.unsqueeze(0).to(self.device)
+    #             out = self.target_model(img)
+    #             prob = torch.softmax(out, dim=1)
+    #             max_conf, _ = torch.max(prob, dim=1)
+    #             attack_input = max_conf.unsqueeze(1)
+    #             pred = self.attack_model(attack_input).item()
+    #             results.append(("in" if pred>0.5 else "out", max_conf.item()))
+    #     return results
    
     @staticmethod
     def pca_denoise(image_tensor, n_components_ratio=0.5):
@@ -165,47 +276,34 @@ class MaliciousClient(Client):
 
 
     def deep_leakage_reconstruct(self, real_image, real_label, model, steps=2000, lr=0.1):
-        """Reconstruct image using Deep Leakage from Gradients."""
-        def total_variation_loss(img):
-            tv_h = torch.mean(torch.abs(img[:, :, 1:, :] - img[:, :, :-1, :]))
-            tv_w = torch.mean(torch.abs(img[:, :, :, 1:] - img[:, :, :, :-1]))
-            return tv_h + tv_w
-
-        dummy_data = torch.rand_like(real_image, requires_grad=True, device=self.device)
-        optimizer = optim.Adam([dummy_data], lr=lr)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
-        loss_fn = nn.CrossEntropyLoss()
-
         model.eval()
-        for step in range(steps):
+
+        # Define a random initial image with the same shape as the original image
+        initial_image = torch.randn_like(real_image, requires_grad=True, device=DEVICE)
+
+        # Define the loss function and optimizer
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam([initial_image], lr=lr)
+
+        # Perform gradient ascent
+        for i in range(steps):
             optimizer.zero_grad()
-            
-            # Forward pass for real image
-            real_output = model(real_image)
-            real_loss = loss_fn(real_output, real_label)
-            real_grad = torch.autograd.grad(real_loss, model.parameters(), create_graph=True)
-
-            # Forward pass for dummy image
-            dummy_output = model(dummy_data)
-            dummy_loss = loss_fn(dummy_output, real_label)
-            dummy_grad = torch.autograd.grad(dummy_loss, model.parameters(), create_graph=True)
-
-            # Compute gradient matching loss
-            grad_loss = sum(torch.norm(dg - rg) for dg, rg in zip(dummy_grad, real_grad))
-
-            # Add Total Variation Loss for smoothness
-            tv_loss = total_variation_loss(dummy_data)
-            total_loss = grad_loss + 1e-4 * tv_loss  # Regularize TV loss
-
-            # Backpropagation and update
-            total_loss.backward()
+            output = model(initial_image)
+            loss = -criterion(output, torch.tensor([real_label]).to(DEVICE))  # Maximize the probability of the desired label
+            loss.backward()
             optimizer.step()
-            scheduler.step()
 
-            if step % 500 == 0:
-                print(f"Step {step}, Gradient Loss: {grad_loss.item():.4f}, TV Loss: {tv_loss.item():.4f}")
+            if i % 100 == 0:
+                print(f'Iteration {i}, Loss: {loss.item()}')
 
-        return dummy_data
+        # Ensure the generated image matches the desired label
+        # with torch.no_grad():
+        #     final_output = model(initial_image)
+        #     predicted_label = torch.argmax(final_output, dim=1)
+
+        # Return the generated image
+        generated_image = initial_image.squeeze().cpu()
+        return generated_image
     
 
 
@@ -234,31 +332,35 @@ class MaliciousClient(Client):
         if confidence_mnist > confidence_fashion:
             print("[Malicious Client] Using MNIST for reconstruction.")
             chosen_loader = self.mnist_loader
+            self.population = "mnist"
         else:
             print("[Malicious Client] Using FashionMNIST for reconstruction.")
             chosen_loader = self.fashion_loader
 
+        if self.attack_model is None:
+            self.train_attack_model()
+
         # Perform DLG attack for each image in the batch
-        real_images, real_labels = next(iter(chosen_loader))
-        real_images, real_labels = real_images.to(self.device), real_labels.to(self.device)
+        # real_images, real_labels = next(iter(chosen_loader))
+        # real_images, real_labels = real_images.to(self.device), real_labels.to(self.device)
 
-        print("[Malicious Client] Performing Deep Leakage Attack for each image...")
+        # print("[Malicious Client] Performing Deep Leakage Attack for each image...")
 
-        for i in range(real_images.size(0)):  # Loop through each image in the batch
-            single_image = real_images[i].unsqueeze(0)  # Select one image and add batch dimension
-            single_label = real_labels[i].unsqueeze(0)  # Select corresponding label and add batch dimension
+        # for i in range(real_images.size(0)):  # Loop through each image in the batch
+        #     single_image = real_images[i].unsqueeze(0)  # Select one image and add batch dimension
+        #     single_label = real_labels[i].unsqueeze(0)  # Select corresponding label and add batch dimension
 
-            # Perform DLG attack to reconstruct image
-            reconstructed_image = self.deep_leakage_reconstruct(single_image, single_label, self.model)
+        #     # Perform DLG attack to reconstruct image
+        #     reconstructed_image = self.deep_leakage_reconstruct(single_image, single_label, self.model)
 
-            # denoised_image = MaliciousClient.pca_denoise(reconstructed_image.squeeze(), n_components_ratio=0.5)
+        #     # denoised_image = MaliciousClient.pca_denoise(reconstructed_image.squeeze(), n_components_ratio=0.5)
 
-            # Save original and reconstructed images
-            torchvision.utils.save_image(single_image, f"real_image_{i}.png")
-            torchvision.utils.save_image(reconstructed_image, f"reconstructed_image_{i}.png")
-            print(f"Saved real_image_{i}.png and reconstructed_image_{i}.png.")
+        #     # Save original and reconstructed images
+        #     torchvision.utils.save_image(single_image, f"real_image_{i}.png")
+        #     torchvision.utils.save_image(reconstructed_image, f"reconstructed_image_{i}.png")
+        #     print(f"Saved real_image_{i}.png and reconstructed_image_{i}.png.")
 
-        # Continue normal local training and return gradients
+        # # Continue normal local training and return gradients
         gradients = super().local_train(global_weights, epochs, lr)
         return gradients
     
